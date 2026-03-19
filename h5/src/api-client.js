@@ -18,6 +18,7 @@ export function uuid() {
 
 const REQUEST_TIMEOUT = 30000
 const MAX_RECONNECT_DELAY = 30000
+const SSE_RECOVERY_GRACE_MS = 8000
 
 /**
  * 智能推断 baseUrl 协议：
@@ -56,6 +57,8 @@ export class WsClient {
     this._lastSseEventId = 0
     this._recentEventHashes = new Map()
     this._sessionRecoverPromise = null
+    this._sseRecoveryTimer = null
+    this._sseRecovering = false
   }
 
   get connected() { return this._connected }
@@ -122,6 +125,7 @@ export class WsClient {
       this._sessionKey = data.sessionKey
       this._lastSseEventId = 0
       this._recentEventHashes.clear()
+      this._clearSseRecovery()
 
       // 2. 开启 SSE 事件流
       this._setupEventSource()
@@ -149,9 +153,15 @@ export class WsClient {
     const es = new EventSource(url)
     this._es = es
 
+    es.onopen = () => {
+      if (esId !== this._esId) return
+      this._clearSseRecovery()
+    }
+
     // 通用事件（Gateway 推送的消息）
     es.addEventListener('message', (evt) => {
       if (esId !== this._esId) return
+      this._clearSseRecovery()
 
       // 去重：优先使用 SSE id，处理重连补发/重复投递
       const idNum = Number(evt.lastEventId || 0)
@@ -182,6 +192,7 @@ export class WsClient {
     // proxy.ready（SSE 重连后的确认）
     es.addEventListener('proxy.ready', () => {
       if (esId !== this._esId) return
+      this._clearSseRecovery()
       if (!this._gatewayReady) {
         this._gatewayReady = true
         this._setConnected(true, 'ready')
@@ -199,11 +210,9 @@ export class WsClient {
 
     es.onerror = () => {
       if (esId !== this._esId) return
-      // EventSource 会自动重连，但如果会话已失效需要完整重连
-      if (this._gatewayReady) {
-        // SSE 短暂断开，EventSource 自动重连，不需要干预
-        console.log('[api] SSE 断开，等待自动重连...')
-      }
+      // EventSource 会自动重连，但这里必须先把接收通道标记为不可用，
+      // 否则会出现“还能发送请求，但收不到回复”的假在线状态。
+      this._beginSseRecovery(esId)
     }
   }
 
@@ -211,6 +220,7 @@ export class WsClient {
   disconnect() {
     this._intentionalClose = true
     this._clearReconnectTimer()
+    this._clearSseRecovery()
     this._closeEventSource()
     if (this._sid && this._baseUrl) {
       fetch(`${this._baseUrl}/api/disconnect`, {
@@ -230,6 +240,7 @@ export class WsClient {
     this._intentionalClose = false
     this._reconnectAttempts = 0
     this._clearReconnectTimer()
+    this._clearSseRecovery()
     this._closeEventSource()
     this._sid = null
     this._gatewayReady = false
@@ -273,7 +284,7 @@ export class WsClient {
   async request(method, params = {}, hasRetriedAfterSessionMissing = false) {
     if (!this._sid || !this._gatewayReady) {
       // 等待重连就绪后重试
-      if (!this._intentionalClose && this._reconnectAttempts > 0) {
+      if (!this._intentionalClose && (this._reconnectAttempts > 0 || this._sseRecovering)) {
         return new Promise((resolve, reject) => {
           const waitTimeout = setTimeout(() => {
             unsub()
@@ -403,6 +414,31 @@ export class WsClient {
       this._esId++
       try { old.close() } catch {}
     }
+  }
+
+  _clearSseRecovery() {
+    this._sseRecovering = false
+    if (this._sseRecoveryTimer) {
+      clearTimeout(this._sseRecoveryTimer)
+      this._sseRecoveryTimer = null
+    }
+  }
+
+  _beginSseRecovery(esId) {
+    if (this._intentionalClose) return
+    this._gatewayReady = false
+    this._setConnected(false, 'reconnecting')
+
+    if (this._sseRecovering) return
+    this._sseRecovering = true
+    console.warn('[api] SSE 断开，进入恢复窗口...')
+
+    this._sseRecoveryTimer = setTimeout(() => {
+      this._sseRecoveryTimer = null
+      if (esId !== this._esId || this._intentionalClose) return
+      console.warn('[api] SSE 未在宽限期内恢复，强制重连会话')
+      this.reconnect()
+    }, SSE_RECOVERY_GRACE_MS)
   }
 
   _clearReconnectTimer() {

@@ -7,14 +7,15 @@
  * - 后台同步
  */
 
-const CACHE_NAME = 'clawapp-v2'
-const OFFLINE_URL = '/offline.html'
+const VERSION = new URL(self.location.href).searchParams.get('v') || 'dev'
+const CACHE_NAME = `clawapp-${VERSION}`
+const APP_SHELL_CACHE = `clawapp-shell-${VERSION}`
 
 // 需要缓存的静态资源
 const STATIC_ASSETS = [
-  '/',
-  '/index.html',
   '/manifest.json',
+  '/favicon.svg',
+  '/icon-180.png',
   '/icon-192.png',
   '/icon-512.png'
 ]
@@ -58,20 +59,27 @@ self.addEventListener('activate', event => {
 // ============ 抓取阶段 ============
 self.addEventListener('fetch', event => {
   const { request } = event
+  if (request.method !== 'GET') return
   const url = new URL(request.url)
   
   // Skip cross-origin requests
   if (url.origin !== location.origin) {
     return
   }
-  
-  // 网络优先策略（API 和动态内容）
+
+  // API/SSE 一律直连网络，避免脏缓存
   if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/ws')) {
-    event.respondWith(networkFirst(request))
+    event.respondWith(networkOnly(request))
     return
   }
-  
-  // 缓存优先策略（静态资源）
+
+  // HTML 导航优先拿网络，确保入口页尽快更新到新版本
+  if (request.mode === 'navigate' || request.destination === 'document') {
+    event.respondWith(networkFirstPage(request))
+    return
+  }
+
+  // 带 hash 的静态资源适合缓存优先
   event.respondWith(cacheFirst(request))
 })
 
@@ -90,22 +98,31 @@ async function cacheFirst(request) {
     }
     return response
   } catch (error) {
-    return caches.match('/index.html')
+    return caches.match(request)
   }
 }
 
-// ============ 网络优先策略 ============
-async function networkFirst(request) {
+// ============ 页面网络优先策略 ============
+async function networkFirstPage(request) {
   try {
     const response = await fetch(request)
     if (response.ok) {
-      const cache = await caches.open(CACHE_NAME)
+      const cache = await caches.open(APP_SHELL_CACHE)
       cache.put(request, response.clone())
     }
     return response
   } catch (error) {
     const cached = await caches.match(request)
-    return cached || new Response(JSON.stringify({ error: 'offline' }), {
+    return cached || caches.match('/index.html')
+  }
+}
+
+// ============ API 直连网络 ============
+async function networkOnly(request) {
+  try {
+    return await fetch(request)
+  } catch (error) {
+    return new Response(JSON.stringify({ error: 'offline' }), {
       status: 503,
       headers: { 'Content-Type': 'application/json' }
     })

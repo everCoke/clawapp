@@ -39,6 +39,7 @@ let _seenFinalRunIds = new Set()
 let _lastFinalSig = ''
 let _lastFinalAt = 0
 let _lastReconnectNoticeAt = 0
+let _historyLoadSeq = 0
 const RENDER_THROTTLE = 30 // 渲染节流间隔 ms
 const FINAL_DUP_WINDOW_MS = 5000
 const RECONNECT_NOTICE_COOLDOWN_MS = 5000
@@ -171,6 +172,19 @@ export function setSessionKey(key) {
   }
 
   setPickerSessionKey(_sessionKey)
+  updateSessionTitle()
+}
+
+export function replaceSessionKey(key) {
+  _sessionKey = key || ''
+  if (_sessionKey) localStorage.setItem(STORAGE_SESSION_KEY, _sessionKey)
+  else localStorage.removeItem(STORAGE_SESSION_KEY)
+  setPickerSessionKey(_sessionKey)
+  _lastHistoryHash = ''
+  _seenFinalRunIds.clear()
+  _lastFinalSig = ''
+  _lastFinalAt = 0
+  resetStreamState()
   updateSessionTitle()
 }
 export function getSessionKey() { return _sessionKey }
@@ -1090,11 +1104,14 @@ function formatTime(date) {
 
 export async function loadHistory() {
   if (!_sessionKey) return
+  const targetSessionKey = _sessionKey
+  const loadSeq = ++_historyLoadSeq
   const hasExisting = _messagesEl?.querySelector('.msg')
 
   // 首次加载：显示本地缓存（快速展示，不等待服务端）
   if (!hasExisting && isStorageAvailable()) {
-    const local = await getLocalMessages(_sessionKey, 200)
+    const local = await getLocalMessages(targetSessionKey, 200)
+    if (loadSeq !== _historyLoadSeq || targetSessionKey !== _sessionKey) return
     if (local.length) {
       clearMessages()
       local.forEach(msg => {
@@ -1110,9 +1127,10 @@ export async function loadHistory() {
   if (!wsClient.gatewayReady) return
   try {
     const [chatResult, notifyItems] = await Promise.all([
-      wsClient.chatHistory(_sessionKey, 200),
+      wsClient.chatHistory(targetSessionKey, 200),
       wsClient.notifyHistory(),
     ])
+    if (loadSeq !== _historyLoadSeq || targetSessionKey !== _sessionKey) return
 
     if (!chatResult?.messages?.length) {
       if (!_messagesEl.querySelector('.msg')) { clearMessages(); appendSystemMessage(t('chat.no.messages')) }
@@ -1130,7 +1148,7 @@ export async function loadHistory() {
     if (hasExisting && (_isSending || _isStreaming || _messageQueue.length > 0)) {
       saveMessages(chatResult.messages.map(m => {
         const c = extractContent(m)
-        return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
+        return { id: m.id || uuid(), sessionKey: targetSessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
       }))
       return
     }
@@ -1148,10 +1166,11 @@ export async function loadHistory() {
     insertNotifyItemsInOrder(notifyItems)
     saveMessages(chatResult.messages.map(m => {
       const c = extractContent(m)
-      return { id: m.id || uuid(), sessionKey: _sessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
+      return { id: m.id || uuid(), sessionKey: targetSessionKey, role: m.role, content: c?.text || '', timestamp: m.timestamp || Date.now() }
     }))
     scrollToBottom()
   } catch (e) {
+    if (loadSeq !== _historyLoadSeq || targetSessionKey !== _sessionKey) return
     console.error('[chat] loadHistory error:', e)
     if (isSessionMissingError(e.message)) {
       fallbackToDefaultSessionWithNotice()

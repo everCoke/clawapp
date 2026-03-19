@@ -1,12 +1,14 @@
 import './style.css'
 import { wsClient } from './api-client.js'
-import { createChatPage, initChatUI, setSessionKey, loadHistory } from './chat-ui.js'
+import { createChatPage, initChatUI, setSessionKey, replaceSessionKey, getSessionKey, loadHistory } from './chat-ui.js'
 import { initI18n, t, onLangChange } from './i18n.js'
 import { initTheme } from './theme.js'
 import { initOfflineHandler } from './offline-queue.js'
 
 const STORAGE_KEY = 'clawapp-config'
 const GUIDE_KEY = 'clawapp-guide-shown'
+const SW_RELOAD_KEY = 'clawapp-sw-reloaded'
+const SW_UPDATE_INTERVAL_MS = 5 * 60 * 1000
 
 // 初始化 i18n 和主题
 initI18n()
@@ -22,13 +24,32 @@ function saveConfig(host, token) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify({ host, token }))
 }
 
+function getDefaultHost() {
+  return location.hostname && location.hostname !== 'localhost'
+    ? (location.port ? `${location.hostname}:${location.port}` : location.hostname)
+    : 'localhost:3210'
+}
+
+// If the hosted ClawApp page is opened under clawapp.<domain> but localStorage still
+// remembers the bare gateway host from an older setup, migrate back to the proxy host.
+function migrateHostedConfig(config) {
+  if (!config?.host) return config
+  const currentHost = getDefaultHost()
+  if (!currentHost.startsWith('clawapp.')) return config
+  const bareHost = currentHost.slice('clawapp.'.length)
+  if (config.host === bareHost) {
+    const next = { ...config, host: currentHost }
+    saveConfig(next.host, next.token || '')
+    return next
+  }
+  return config
+}
+
 function createSetupPage() {
   const page = document.createElement('div')
   page.className = 'page setup-page'
   page.id = 'setup-page'
-  const defaultHost = location.hostname && location.hostname !== 'localhost'
-    ? (location.port ? `${location.hostname}:${location.port}` : location.hostname)
-    : 'localhost:3210'
+  const defaultHost = getDefaultHost()
 
   page.innerHTML = `
     <div class="setup-card">
@@ -166,7 +187,7 @@ function initApp() {
   app.appendChild(setupPage)
   app.appendChild(chatPage)
 
-  const config = getConfig()
+  const config = migrateHostedConfig(getConfig())
   const connectBtn = document.getElementById('connect-btn')
   const hostInput = document.getElementById('input-host')
   const tokenInput = document.getElementById('input-token')
@@ -214,20 +235,7 @@ function initApp() {
 
   // 注册 Gateway 就绪回调 - 每次连接/重连都会触发
   wsClient.onReady((hello, sessionKey) => {
-    setSessionKey(sessionKey)  // 内部会优先恢复 localStorage 保存的会话
-    showPage('chat-page')
-    if (!chatInitialized) {
-      chatInitialized = true
-      initChatUI(() => {
-        wsClient.disconnect()
-        showPage('setup-page')
-        chatInitialized = false
-      })
-    }
-    // 确保 DOM 就绪后再加载历史
-    requestAnimationFrame(() => loadHistory())
-    // 首次使用显示引导
-    showGuideIfNeeded()
+    void handleGatewayReady(sessionKey)
   })
 
   // 自动连接
@@ -261,6 +269,53 @@ function initApp() {
     }
     ti.onkeydown = (e) => { if (e.key === 'Enter') btn.click() }
   })
+}
+
+async function handleGatewayReady(sessionKey) {
+  const defaultSessionKey =
+    sessionKey ||
+    wsClient.snapshot?.sessionDefaults?.mainSessionKey ||
+    `agent:${wsClient.snapshot?.sessionDefaults?.defaultAgentId || 'main'}:main`
+
+  setSessionKey(defaultSessionKey)
+
+  try {
+    const result = await wsClient.sessionsList(200)
+    const sessions = result?.sessions || result || []
+    const visibleKeys = new Set(
+      sessions
+        .map(item => item?.sessionKey || item?.key || '')
+        .filter(Boolean)
+    )
+    const activeKey = getSessionKey()
+    if (activeKey && !visibleKeys.has(activeKey)) {
+      replaceSessionKey(defaultSessionKey)
+    }
+  } catch (e) {
+    console.warn('[main] validate active session failed:', e)
+    replaceSessionKey(defaultSessionKey)
+  }
+
+  showPage('chat-page')
+  let shouldLoadHistory = false
+  if (!chatInitialized) {
+    chatInitialized = true
+    shouldLoadHistory = true
+    initChatUI(() => {
+      wsClient.disconnect()
+      showPage('setup-page')
+      chatInitialized = false
+    })
+  }
+  // 初次进入或当前视图为空时再拉历史，避免重连时整页式重刷
+  if (!shouldLoadHistory) {
+    shouldLoadHistory = !document.querySelector('#chat-messages .msg')
+  }
+  if (shouldLoadHistory) {
+    requestAnimationFrame(() => loadHistory())
+  }
+  // 首次使用显示引导
+  showGuideIfNeeded()
 }
 
 function doConnect(host, token, errorEl, connectBtn) {
@@ -342,4 +397,43 @@ function showGuideIfNeeded() {
   document.body.appendChild(overlay)
 }
 
+function initServiceWorkerUpdates() {
+  if (!('serviceWorker' in navigator)) return
+  if (location.protocol !== 'http:' && location.protocol !== 'https:') return
+
+  let registration = null
+  let lastUpdateCheckAt = 0
+
+  const reloadForNewWorker = () => {
+    if (sessionStorage.getItem(SW_RELOAD_KEY) === __APP_BUILD_ID__) return
+    sessionStorage.setItem(SW_RELOAD_KEY, __APP_BUILD_ID__)
+    location.reload()
+  }
+
+  const checkForSwUpdate = async () => {
+    const now = Date.now()
+    if (!registration || now - lastUpdateCheckAt < SW_UPDATE_INTERVAL_MS) return
+    lastUpdateCheckAt = now
+    try {
+      await registration.update()
+    } catch {}
+  }
+
+  navigator.serviceWorker.addEventListener('controllerchange', reloadForNewWorker)
+
+  navigator.serviceWorker.register(`/sw.js?v=${encodeURIComponent(__APP_BUILD_ID__)}`)
+    .then((reg) => {
+      registration = reg
+      return checkForSwUpdate()
+    })
+    .catch(() => {})
+
+  window.addEventListener('focus', () => { void checkForSwUpdate() })
+  window.addEventListener('online', () => { void checkForSwUpdate() })
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') void checkForSwUpdate()
+  })
+}
+
+initServiceWorkerUpdates()
 initApp()

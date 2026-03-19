@@ -10,6 +10,35 @@ let _onSwitch = null
 let _onSystemMsg = null
 let _onClearSessionMessages = null
 
+function bindTapActivate(el, handler) {
+  let pointerStart = null
+  let lastHandledAt = 0
+
+  const run = () => {
+    const now = Date.now()
+    if (now - lastHandledAt < 400) return
+    lastHandledAt = now
+    handler()
+  }
+
+  el.onclick = () => run()
+  el.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return
+    pointerStart = { x: e.clientX, y: e.clientY }
+  })
+  el.addEventListener('pointerup', (e) => {
+    if (e.pointerType !== 'touch' || !pointerStart) return
+    const dx = Math.abs(e.clientX - pointerStart.x)
+    const dy = Math.abs(e.clientY - pointerStart.y)
+    pointerStart = null
+    if (dx > 12 || dy > 12) return
+    run()
+  })
+  el.addEventListener('pointercancel', () => {
+    pointerStart = null
+  })
+}
+
 function escapeText(str) {
   const div = document.createElement('div')
   div.textContent = str
@@ -111,12 +140,12 @@ export async function refreshSessionList() {
         <button class="session-delete-btn" title="${t('session.delete')}">✕</button>
       `
 
-      // 点击切换会话
-      item.querySelector('.session-item-content').onclick = () => {
+      // 同时兼容 click 和移动端 touch/pointer 轻点
+      bindTapActivate(item, () => {
         if (key === _sessionKey) { closeSessionPicker(); return }
         _onSwitch?.(key)
         closeSessionPicker()
-      }
+      })
 
       // 删除按钮
       item.querySelector('.session-delete-btn').onclick = (e) => {
